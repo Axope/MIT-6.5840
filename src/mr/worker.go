@@ -103,8 +103,8 @@ func Worker(mapf func(string, string) []KeyValue,
 
 			for i := 0; i < reduceNum; i++ {
 				ofile := tsk.OutputFile + strconv.Itoa(i)
-				writeToFile(ofile, parts[i], tsk.FileIdx, i, tsk.Type)
-				// go WriteToFile(filename, parts[i], t.InputFile[0], i)
+				// writeToFile(ofile, parts[i], tsk.FileIdx, i, tsk.Type)
+				go writeToFile(ofile, parts[i], tsk.FileIdx, i, tsk.Type)
 			}
 
 		} else if tsk.Type == REDUCETASK {
