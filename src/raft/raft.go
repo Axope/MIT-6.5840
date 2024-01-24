@@ -59,6 +59,11 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type Entry struct {
+	Term    int
+	Command interface{}
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        *sync.Mutex         // Lock to protect shared access to this peer's state
@@ -75,6 +80,12 @@ type Raft struct {
 	votedFor       int
 	electionTimer  *time.Timer
 	heartbeatTimer *time.Timer
+
+	log         []Entry
+	commitIndex int
+	// lastApplied int
+	nextIndex  []int
+	matchIndex []int
 
 	Logger *zap.Logger
 }
@@ -167,25 +178,28 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	// reject
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
-	} else if args.Term == rf.currentTerm {
-		if rf.votedFor == -1 {
-			rf.votedFor = args.CandidateId
-			rf.electionTimer.Reset(randDefaultTime())
+	}
 
-			reply.Term = rf.currentTerm
-			reply.VoteGranted = true
-		}
-	} else {
-		rf.status = FOLLOWER
+	// change to Follower
+	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
+		rf.status = FOLLOWER
+		rf.votedFor = -1
+	}
+	rf.electionTimer.Reset(randDefaultTime())
+
+	if rf.votedFor == -1 {
 		rf.votedFor = args.CandidateId
-		rf.electionTimer.Reset(randDefaultTime())
 
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
+	} else {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
 	}
 }
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
@@ -197,28 +211,47 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 type AppendEntriesArgs struct {
 	Term     int
 	LeaderID int
+
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []Entry
+	LeaderCommit int
 }
 type AppendEntriesReply struct {
-	Term int
+	Term    int
+	Success bool
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	// reject
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
-	} else if args.Term == rf.currentTerm {
-		rf.electionTimer.Reset(randDefaultTime())
+		reply.Success = false
+	}
 
-		reply.Term = rf.currentTerm
-	} else {
-		rf.status = FOLLOWER
+	// change to Follower
+	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
+		rf.status = FOLLOWER
 		rf.votedFor = -1
-		rf.electionTimer.Reset(randDefaultTime())
+	}
+	rf.electionTimer.Reset(randDefaultTime())
 
-		reply.Term = rf.currentTerm
+	reply.Term = rf.currentTerm
+	if len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+	} else {
+		reply.Success = true
+
+		rf.log = rf.log[:args.PrevLogIndex]
+		rf.log = append(rf.log, args.Entries...)
+
+		if rf.commitIndex < args.LeaderCommit {
+			rf.commitIndex = args.LeaderCommit
+		}
 	}
 }
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -314,6 +347,12 @@ func (rf *Raft) leaderElection() {
 						rf.mu.Lock()
 						if rf.status != LEADER {
 							rf.status = LEADER
+							// init nextIndex and matchIndex
+							length := len(rf.log) - 1
+							for i := range rf.nextIndex {
+								rf.nextIndex[i] = length
+								rf.matchIndex[i] = 0
+							}
 							go rf.BroadcastHeartbeat()
 						}
 						rf.mu.Unlock()
@@ -380,6 +419,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		votedFor:       -1,
 		electionTimer:  time.NewTimer(randDefaultTime()),
 		heartbeatTimer: time.NewTimer(HeartbeatInterval),
+
+		log:         make([]Entry, 1), // 第一个是空的
+		commitIndex: 0,
+		nextIndex:   make([]int, len(peers)),
+		matchIndex:  make([]int, len(peers)),
 	}
 
 	// Your initialization code here (2A, 2B, 2C).
