@@ -291,10 +291,13 @@ func (rf *Raft) leaderElection() {
 	rf.mu.Lock()
 	rf.votedFor = rf.me
 	rf.mu.Unlock()
-	rf.Logger.Sugar().Debugf("self vote, voteFor = %v", rf.votedFor)
 	var cnt int = 1 // cnt不需要上锁影响效率
+
+	rf.Logger.Sugar().Debugf("self vote, voteFor = %v", rf.votedFor)
+
 	for i := range rf.peers {
 		if i != rf.me {
+
 			go func(i int) {
 				args := &RequestVoteArgs{
 					Term:        rf.currentTerm,
@@ -303,6 +306,7 @@ func (rf *Raft) leaderElection() {
 				reply := &RequestVoteReply{}
 				if rf.sendRequestVote(i, args, reply) && reply.VoteGranted {
 					rf.Logger.Sugar().Debugf("VoteGranted from = %v", i)
+
 					cnt++
 					if cnt > len(rf.peers)/2 {
 						rf.Logger.Sugar().Debugf("<leader>, cnt = %v", cnt)
@@ -310,14 +314,15 @@ func (rf *Raft) leaderElection() {
 						rf.mu.Lock()
 						if rf.status != LEADER {
 							rf.status = LEADER
+							go rf.BroadcastHeartbeat()
 						}
 						rf.mu.Unlock()
 
-						rf.BroadcastHeartbeat()
 					}
 				}
 
 			}(i)
+
 		}
 	}
 
