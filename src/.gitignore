@@ -13,3 +13,4 @@ mrtmp.*
 test/
 *.log
 mr-*
+my_test.go
