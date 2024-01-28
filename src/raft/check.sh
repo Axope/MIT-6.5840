@@ -1,10 +1,18 @@
 #!/bin/bash
 
+if [ "$#" -ne 2 ]; then
+    echo "Usage: $0 <num> <letter>"
+    exit 1
+fi
+
+num=$1
+letter=$2
 error_count=0
 
-for i in {1..10}; do
+for ((i = 1; i <= num; i++)); do
     echo "Running test iteration $i..."
-    go test -run 2B
+    echo "go test -run 2$letter"
+    go test -run 2$letter
 
     if [ $? -ne 0 ]; then
         echo "Test failed!"
