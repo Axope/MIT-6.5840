@@ -74,9 +74,6 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
-	// Your data here (2A, 2B, 2C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
 	status         int
 	currentTerm    int
 	votedFor       int
@@ -164,11 +161,6 @@ func (rf *Raft) persist(snapshot []byte) {
 		snapshot = rf.persister.ReadSnapshot()
 	}
 	rf.persister.Save(raftstate, snapshot)
-	// if snapshot != nil {
-	// 	rf.persister.Save(raftstate, snapshot)
-	// } else {
-	// 	rf.persister.Save(raftstate, rf.persister.ReadSnapshot())
-	// }
 
 	rf.Logger.Sugar().Debugf("Save(%v, %v)", raftstate, snapshot)
 	rf.Logger.Sugar().Debugf("ReadSnapshot %v", rf.persister.ReadSnapshot())
@@ -252,21 +244,6 @@ func (rf *Raft) getRealIndex(index int) int {
 
 func (rf *Raft) getRealEntry(index int) Entry {
 	return rf.log[rf.getRealIndex(index)]
-	// snapLastIndex := rf.logLastIndex - len(rf.log) + 1
-	// arrIndex := index - snapLastIndex
-	// if arrIndex <= 0 {
-	// 	// snapshotBytes := rf.persister.ReadSnapshot()
-	// 	// arrIndex += snapLastIndex
-	// 	// return snapshot[arrIndex]
-	// 	rf.Logger.Error("index in snapshot")
-	// 	return Entry{}
-	// }
-
-	// if arrIndex >= len(rf.log) {
-	// 	rf.Logger.Error("array bound")
-	// 	return Entry{}
-	// }
-	// return rf.log[arrIndex]
 }
 
 // RequestVote RPC
@@ -363,21 +340,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		if rf.commitIndex < args.LeaderCommit {
 			rf.commitIndex = args.LeaderCommit
-			// if len(rf.log)-1 < rf.commitIndex {
-			// 	rf.commitIndex = len(rf.log) - 1
-			// }
-			// rf.applySig <- true
-			// for rf.lastApplied < rf.commitIndex {
-			// 	rf.lastApplied++
-			// 	msg := ApplyMsg{
-			// 		CommandValid: true,
-			// 		Command:      rf.getRealEntry(rf.lastApplied).Command,
-			// 		CommandIndex: rf.lastApplied,
-			// 	}
-			// 	rf.applyCh <- msg
-			// 	rf.Logger.Debug("apply", zap.Any("ApplyMsg", msg))
-			// }
-			// rf.lastApplied = rf.commitIndex
 		}
 	}
 
@@ -395,10 +357,8 @@ type InstallSnapshotArgs struct {
 	LeaderID         int
 	LastIncludeIndex int
 	LastIncludeTerm  int
-	// Offset           int
 
 	Data []byte
-	// Done bool
 }
 type InstallSnapshotReply struct {
 	Term int
@@ -608,18 +568,6 @@ func (rf *Raft) BroadcastHeartbeat() {
 								cnt++
 								if cnt > len(rf.peers)/2 {
 									rf.commitIndex = rf.matchIndex[i]
-									// rf.applySig <- true
-									// for rf.lastApplied < rf.commitIndex {
-									// 	rf.lastApplied++
-									// 	msg := ApplyMsg{
-									// 		CommandValid: true,
-									// 		Command:      rf.getRealEntry(rf.lastApplied).Command,
-									// 		CommandIndex: rf.lastApplied,
-									// 	}
-									// 	rf.applyCh <- msg
-									// 	rf.Logger.Debug("apply", zap.Any("ApplyMsg", msg))
-									// }
-									// rf.lastApplied = rf.commitIndex
 									rf.Logger.Sugar().Debugf("update commitIndex to %v", rf.commitIndex)
 									break
 								}
@@ -788,9 +736,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		nextIndex:  make([]int, len(peers)),
 		matchIndex: make([]int, len(peers)),
 	}
-	// for i := range rf.nextIndex {
-	// 	rf.nextIndex[i] = len(rf.log)
-	// }
 
 	rf.Logger = NewLogger("DEBUG", "Raft-"+strconv.Itoa(me)+".log")
 
