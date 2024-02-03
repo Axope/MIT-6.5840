@@ -80,7 +80,8 @@ type Raft struct {
 	electionTimer  *time.Timer
 	heartbeatTimer *time.Timer
 
-	applyCh chan ApplyMsg
+	applyCh   chan ApplyMsg
+	applyCond *sync.Cond
 
 	log          []Entry
 	logLastIndex int
@@ -340,6 +341,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		if rf.commitIndex < args.LeaderCommit {
 			rf.commitIndex = args.LeaderCommit
+			rf.applyCond.Signal()
 		}
 	}
 
@@ -378,7 +380,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	reply.Term = rf.currentTerm
 	// 重置状态机
-	if rf.logLastIndex <= args.LastIncludeIndex || rf.getRealEntry(args.LastIncludeIndex).Term != args.LastIncludeTerm {
+	if rf.commitIndex < args.LastIncludeIndex || rf.getRealEntry(args.LastIncludeIndex).Term != args.LastIncludeTerm {
 		rf.persist(args.Data)
 		rf.log = make([]Entry, 1)
 		rf.log[0] = Entry{
@@ -399,23 +401,23 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.Logger.Sugar().Debugf("InstallSnapshot reset end, Node = %v", rf.debug())
 		return
 	}
-	// 需保留不冲突的log
-	rf.persist(args.Data)
-	rf.log = rf.log[rf.getRealIndex(args.LastIncludeIndex):]
-	if rf.commitIndex < args.LastIncludeIndex {
-		rf.commitIndex = args.LastIncludeIndex
-	}
-	if rf.lastApplied < args.LastIncludeIndex {
-		rf.lastApplied = args.LastIncludeIndex
-	}
+	// // 需保留不冲突的log
+	// rf.persist(args.Data)
+	// rf.log = rf.log[rf.getRealIndex(args.LastIncludeIndex):]
+	// if rf.commitIndex < args.LastIncludeIndex {
+	// 	rf.commitIndex = args.LastIncludeIndex
+	// }
+	// if rf.lastApplied < args.LastIncludeIndex {
+	// 	rf.lastApplied = args.LastIncludeIndex
+	// }
 
-	rf.applyCh <- ApplyMsg{
-		SnapshotValid: true,
-		Snapshot:      args.Data,
-		SnapshotTerm:  args.LastIncludeTerm,
-		SnapshotIndex: args.LastIncludeIndex,
-	}
-	rf.Logger.Sugar().Debugf("InstallSnapshot cut end, Node = %v", rf.debug())
+	// rf.applyCh <- ApplyMsg{
+	// 	SnapshotValid: true,
+	// 	Snapshot:      args.Data,
+	// 	SnapshotTerm:  args.LastIncludeTerm,
+	// 	SnapshotIndex: args.LastIncludeIndex,
+	// }
+	// rf.Logger.Sugar().Debugf("InstallSnapshot cut end, Node = %v", rf.debug())
 
 }
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
@@ -504,7 +506,9 @@ func (rf *Raft) BroadcastHeartbeat() {
 
 				go func(i int, args *InstallSnapshotArgs) {
 					reply := &InstallSnapshotReply{}
-					rf.sendInstallSnapshot(i, args, reply)
+					if !rf.sendInstallSnapshot(i, args, reply) {
+						return
+					}
 
 					rf.mu.Lock()
 					rf.Logger.Debug("sendInstallSnapshot", zap.Any("to", i), zap.Any("args", args))
@@ -542,7 +546,9 @@ func (rf *Raft) BroadcastHeartbeat() {
 
 			go func(i int, args *AppendEntriesArgs) {
 				reply := &AppendEntriesReply{}
-				rf.sendAppendEntries(i, args, reply)
+				if !rf.sendAppendEntries(i, args, reply) {
+					return
+				}
 
 				rf.mu.Lock()
 				rf.Logger.Debug("sendAppendEntries", zap.Any("to", i), zap.Any("args", args))
@@ -561,14 +567,18 @@ func (rf *Raft) BroadcastHeartbeat() {
 					rf.nextIndex[i] = args.PrevLogIndex + len(args.Entries) + 1
 					rf.matchIndex[i] = rf.nextIndex[i] - 1
 
-					if rf.matchIndex[i] > rf.commitIndex && rf.getRealEntry(rf.matchIndex[i]).Term == rf.currentTerm {
+					if rf.matchIndex[i] > rf.commitIndex &&
+						rf.getRealEntry(rf.matchIndex[i]).Term == rf.currentTerm &&
+						args.Term == rf.currentTerm {
+
 						cnt := 1
 						for j := range rf.peers {
-							if rf.matchIndex[j] >= rf.matchIndex[i] && j != rf.me {
+							if rf.matchIndex[j] >= rf.matchIndex[i] && j != rf.me && rf.getRealEntry(rf.matchIndex[j]).Term == rf.currentTerm {
 								cnt++
 								if cnt > len(rf.peers)/2 {
-									rf.commitIndex = rf.matchIndex[i]
 									rf.Logger.Sugar().Debugf("update commitIndex to %v", rf.commitIndex)
+									rf.commitIndex = rf.matchIndex[i]
+									rf.applyCond.Signal()
 									break
 								}
 							}
@@ -663,7 +673,7 @@ func randDefaultTime() time.Duration {
 
 func (rf *Raft) ticker() {
 	for !rf.killed() {
-		rf.Logger.Sugar().Debugf("ticke Node = %v", rf.debug())
+		// rf.Logger.Sugar().Debugf("ticke Node = %v", rf.debug())
 
 		select {
 		case <-rf.electionTimer.C:
@@ -687,17 +697,33 @@ func (rf *Raft) ticker() {
 
 func (rf *Raft) applier() {
 	for !rf.killed() {
-		for rf.lastApplied < rf.commitIndex {
-			rf.lastApplied++
-			msg := ApplyMsg{
-				CommandValid: true,
-				Command:      rf.getRealEntry(rf.lastApplied).Command,
-				CommandIndex: rf.lastApplied,
-			}
-			rf.applyCh <- msg
-			rf.Logger.Debug("apply", zap.Any("ApplyMsg", msg))
+		rf.mu.Lock()
+		for rf.lastApplied >= rf.commitIndex {
+			rf.applyCond.Wait()
 		}
-		time.Sleep(HeartbeatInterval / 2)
+
+		lastApplied := rf.lastApplied
+		// log[applyIndex+1, commitIndex+1)
+		indexL := rf.getRealIndex(rf.lastApplied)
+		indexR := rf.getRealIndex(rf.commitIndex)
+		entries := make([]Entry, indexR-indexL)
+		copy(entries, rf.log[indexL+1:indexR+1])
+		rf.mu.Unlock()
+
+		for _, entry := range entries {
+			lastApplied++
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command:      entry.Command,
+				CommandIndex: lastApplied,
+			}
+		}
+
+		rf.mu.Lock()
+		if lastApplied > rf.lastApplied {
+			rf.lastApplied = lastApplied
+		}
+		rf.mu.Unlock()
 	}
 }
 
@@ -736,12 +762,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		nextIndex:  make([]int, len(peers)),
 		matchIndex: make([]int, len(peers)),
 	}
+	rf.applyCond = sync.NewCond(rf.mu)
 
 	rf.Logger = NewLogger("DEBUG", "Raft-"+strconv.Itoa(me)+".log")
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-	rf.Logger.Sugar().Infof("Raft init success, Node = %v", rf.debug())
+	// rf.Logger.Sugar().Infof("Raft init success, Node = %v", rf.debug())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
