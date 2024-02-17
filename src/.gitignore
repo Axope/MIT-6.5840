@@ -16,3 +16,6 @@ mr-*
 my_test.go
 check.out
 nohup.out
+
+*.err
+tester
