@@ -5,12 +5,16 @@ import "go.uber.org/zap"
 func (rf *Raft) updateCommitIndexBySnapshot(index int) {
 	if rf.commitIndex < index {
 		rf.commitIndex = index
+	}
+	if rf.lastApplied < index {
 		rf.lastApplied = index
 	}
 }
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.Logger.Sync()
+
 	rf.Logger.Debug("InstallSnapshot", zap.Any("args", args))
 	defer rf.Logger.Sugar().Debugf("InstallSnapshot end, Node = %v", rf.debug())
 
@@ -18,10 +22,12 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		reply.Term = rf.currentTerm
 		return
 	}
+	// rf.electionTimer.Reset(randElectionTime())
+	rf.resetElectionTimer()
 
 	reply.Term = rf.currentTerm
 	// reject outdated(duplicated) snapshot
-	if args.LastIncludedIndex <= rf.log.getFirstLog().Index {
+	if args.LastIncludedIndex <= rf.commitIndex {
 		rf.Logger.Sugar().Debugf("args.LastIncludedIndex(%v) <= rf.snapshotIndex(%v)",
 			args.LastIncludedIndex, rf.log.getFirstLog())
 		return
@@ -46,12 +52,15 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	rf.updateCommitIndexBySnapshot(args.LastIncludedIndex)
 	rf.persist(args.Data)
-	rf.applyCh <- ApplyMsg{
-		SnapshotValid: true,
-		Snapshot:      args.Data,
-		SnapshotTerm:  args.LastIncludedTerm,
-		SnapshotIndex: args.LastIncludedIndex,
-	}
+
+	go func() {
+		rf.applyCh <- ApplyMsg{
+			SnapshotValid: true,
+			Snapshot:      args.Data,
+			SnapshotTerm:  args.LastIncludedTerm,
+			SnapshotIndex: args.LastIncludedIndex,
+		}
+	}()
 }
 
 func (rf *Raft) sendInstallSnapshotToPeer(i int, args *InstallSnapshotArgs) {

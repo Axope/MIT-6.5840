@@ -5,16 +5,18 @@ import (
 	"time"
 )
 
+type NodeState int
+
 const (
-	LEADER = iota
+	LEADER NodeState = iota
 	FOLLOWER
 	CANDIDATER
 )
 
-const HeartbeatTime = time.Duration(50) * time.Millisecond
+const HeartbeatTime = time.Duration(100) * time.Millisecond
 
-// [300, 450)
+// [500, 650)
 func randElectionTime() time.Duration {
-	ms := 300 + (rand.Int63() % 150)
+	ms := 500 + (rand.Int63() % 150)
 	return time.Duration(ms) * time.Millisecond
 }

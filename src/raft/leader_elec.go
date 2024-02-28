@@ -12,6 +12,7 @@ func (rf *Raft) logNewer(index, term int) bool {
 }
 
 func (rf *Raft) leaderElection() {
+	defer rf.Logger.Sync()
 	rf.Logger.Info("start leader election")
 
 	// rf.status = CANDIDATER
@@ -66,7 +67,7 @@ func (rf *Raft) leaderElection() {
 						rf.nextIndex[i] = length
 						rf.matchIndex[i] = 0
 					}
-					go rf.BroadcastHeartbeat(true)
+					rf.BroadcastHeartbeat(true)
 				}
 			}
 
@@ -78,6 +79,8 @@ func (rf *Raft) leaderElection() {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.Logger.Sync()
+
 	rf.Logger.Debug("recv RequestVote", zap.Any("args", args))
 	defer rf.Logger.Sugar().Debugf("RequestVote end, Node = %v", rf.debug())
 
@@ -95,7 +98,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
 		// 必须要投票成功才能重置选举超时定时器
-		rf.electionTimer.Reset(randElectionTime())
+		// rf.electionTimer.Reset(randElectionTime())
+		rf.resetElectionTimer()
 	} else {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false

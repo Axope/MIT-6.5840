@@ -7,32 +7,41 @@ import (
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.Logger.Sync()
 	rf.Logger.Debug("AppendEntries", zap.Any("args", args))
 	defer rf.Logger.Sugar().Debugf("AppendEntries end, Node = %v", rf.debug())
 
 	if !rf.checkTerm(args.Term) {
 		reply.Term = rf.currentTerm
 		reply.Success = false
-		reply.FirstSameIndex = args.PrevLogIndex + 1
+		// reply.FirstSameIndex = args.PrevLogIndex + 1
 		rf.Logger.Debug("checkTerm exit")
 		return
 	}
-	rf.electionTimer.Reset(randElectionTime())
+	// rf.electionTimer.Reset(randElectionTime())
+	rf.resetElectionTimer()
 
 	if args.Empty {
 		rf.Logger.Debug("empty package")
 		return
 	}
 
+	if args.PrevLogIndex < rf.log.getFirstLog().Index {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+
 	reply.Term = rf.currentTerm
 	if args.PrevLogIndex > rf.log.getLastLog().Index {
 		reply.Success = false
-		reply.FirstSameIndex = rf.log.getLastLog().Index + 1
+		reply.FirstConflictIndex = rf.log.getLastLog().Index + 1
+		reply.ConflictTerm = -1
 		rf.Logger.Sugar().Debugf("args.PrevLogIndex(%v) > rf.log.LastLog(%v), reply = %v",
 			args.PrevLogIndex, rf.log.getLastLog().Index, reply)
 	} else if rf.log.getLogEntryByIndex(args.PrevLogIndex).Term != args.PrevLogTerm {
 		reply.Success = false
-		reply.FirstSameIndex = rf.log.findFirstSameIndex(args.PrevLogIndex, -1)
+		reply.ConflictTerm, reply.FirstConflictIndex = rf.log.findFirstConflict(args.PrevLogIndex)
 	} else {
 		reply.Success = true
 
@@ -60,6 +69,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) updateCommitIndex(index int) {
+	defer rf.Logger.Sync()
+
 	if index <= rf.commitIndex {
 		return
 	}
@@ -93,6 +104,7 @@ func (rf *Raft) sendAppendEntriesToPeer(i int, args *AppendEntriesArgs) {
 	// handle RequestVote RPC
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.Logger.Sync()
 	rf.Logger.Debug("sendAppendEntriesToPeer", zap.Any("to", i),
 		zap.Any("args", args), zap.Any("reply", reply))
 
@@ -117,7 +129,21 @@ func (rf *Raft) sendAppendEntriesToPeer(i int, args *AppendEntriesArgs) {
 	} else {
 		// rf.nextIndex[i]--
 
-		rf.nextIndex[i] = rf.log.findFirstSameIndex(args.PrevLogIndex, reply.FirstSameIndex)
+		// rf.nextIndex[i] = rf.log.findFirstSameIndex(args.PrevLogIndex, reply.FirstSameIndex)
+
+		// if args.PrevLogIndex <= rf.log.getLastLog().Index {
+		// 	rf.nextIndex[i] = rf.log.findFirstSameIndex(args.PrevLogIndex, reply.FirstSameIndex)
+		// }
+
+		newNextIndex := reply.FirstConflictIndex
+		for i := rf.log.getLastLog().Index; i > rf.log.getFirstLog().Index; i-- {
+			if term := rf.log.getLogEntryByIndex(i).Term; term == reply.ConflictTerm {
+				newNextIndex = i
+				break
+			}
+		}
+		rf.nextIndex[i] = newNextIndex
+
 		rf.Logger.Sugar().Debugf("AppendEntries failed, update nextIndex[%v] = %v", i, rf.nextIndex[i])
 	}
 

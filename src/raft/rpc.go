@@ -29,9 +29,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term           int
-	Success        bool
-	FirstSameIndex int
+	Term               int
+	Success            bool
+	FirstConflictIndex int
+	ConflictTerm       int
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {

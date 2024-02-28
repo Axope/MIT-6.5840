@@ -51,17 +51,17 @@ func (log *LogEntries) append(e []Entry) {
 }
 
 // 保证index合法
-func (log *LogEntries) findFirstSameIndex(index int, lower int) int {
+func (log *LogEntries) findFirstConflict(index int) (int, int) {
 	res := index
 	firstIndex := log.getFirstLog().Index
 	arrayIndex := res - firstIndex
 	tmpTerm := log.Entries[arrayIndex].Term
 
-	for arrayIndex-1 >= 0 && log.Entries[arrayIndex-1].Term == tmpTerm && res-1 >= lower {
+	for arrayIndex-1 > 0 && log.Entries[arrayIndex-1].Term == tmpTerm {
 		arrayIndex--
 		res--
 	}
-	return res
+	return tmpTerm, res
 }
 
 func (log *LogEntries) setFirstLog(e Entry) {

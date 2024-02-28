@@ -31,7 +31,7 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
-	status int
+	status NodeState
 
 	currentTerm int
 	votedFor    int
@@ -44,8 +44,12 @@ type Raft struct {
 	applyCond   *sync.Cond
 	applyCh     chan ApplyMsg
 
-	electionTimer  *time.Timer
-	heartbeatTimer *time.Timer
+	// electionTimer  *time.Timer
+	// heartbeatTimer *time.Timer
+	electionTimeout  time.Duration
+	lastElection     time.Time
+	heartbeatTimeout time.Duration
+	lastHeartbeat    time.Time
 
 	Logger *zap.Logger
 }
@@ -94,8 +98,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 		applyCh: applyCh,
 
-		electionTimer:  time.NewTimer(randElectionTime()),
-		heartbeatTimer: time.NewTimer(HeartbeatTime),
+		// electionTimer:  time.NewTimer(randElectionTime()),
+		// heartbeatTimer: time.NewTimer(HeartbeatTime),
 
 		Logger: NewLogger("DEBUG", fmt.Sprintf("Raft-%v.log", me)),
 	}
@@ -104,15 +108,23 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	rf.resetElectionTimer()
+	rf.heartbeatTimeout = HeartbeatTime
+
 	go rf.ticker()
 	go rf.applier()
 
 	return rf
 }
 
-func (rf *Raft) changeState(state int) {
+func (rf *Raft) GetRaftStateSize() int {
+	return rf.persister.RaftStateSize()
+}
+
+func (rf *Raft) changeState(state NodeState) {
 	if rf.status == LEADER && state != LEADER {
-		rf.electionTimer.Reset(randElectionTime())
+		// rf.electionTimer.Reset(randElectionTime())
+		rf.resetElectionTimer()
 	}
 	rf.status = state
 }
@@ -147,6 +159,7 @@ func (rf *Raft) GetState() (int, bool) {
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 func (rf *Raft) persist(snapshot []byte) {
+	defer rf.Logger.Sync()
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 
@@ -158,10 +171,14 @@ func (rf *Raft) persist(snapshot []byte) {
 		snapshot = rf.persister.ReadSnapshot()
 	}
 	rf.persister.Save(raftstate, snapshot)
+	rf.Logger.Debug("persist", zap.Any("currentTerm", rf.currentTerm),
+		zap.Any("votedFor", rf.votedFor),
+		zap.Any("log", rf.log))
 }
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
+	defer rf.Logger.Sync()
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
@@ -182,6 +199,9 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.commitIndex = rf.log.getFirstLog().Index
 		rf.lastApplied = rf.commitIndex
 	}
+	rf.Logger.Debug("recover", zap.Any("currentTerm", rf.currentTerm),
+		zap.Any("votedFor", rf.votedFor),
+		zap.Any("log", rf.log))
 }
 
 // the service says it has created a snapshot that has
@@ -191,11 +211,12 @@ func (rf *Raft) readPersist(data []byte) {
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.Logger.Sync()
 
 	// reject outdated(duplicated) snapshot
 	if index <= rf.log.getFirstLog().Index {
 		rf.Logger.Sugar().Debugf("index(%v) <= rf.snapshotIndex(%v)",
-			index, rf.log.getFirstLog())
+			index, rf.log.getFirstLog().Index)
 		return
 	}
 
@@ -218,6 +239,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.Logger.Sync()
 	rf.Logger.Debug("Start()", zap.Any("command", command))
 
 	if rf.status != LEADER {
@@ -234,6 +256,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.log.append([]Entry{e})
 	rf.Logger.Sugar().Debugf("accept command, Node = %v", rf.debug())
 	rf.persist(nil)
+	rf.BroadcastHeartbeat(false)
 
 	return lastEntry.Index + 1, rf.currentTerm, true
 }
@@ -251,13 +274,11 @@ func (rf *Raft) needInstallSnapshot(checkIndex int) bool {
 }
 
 func (rf *Raft) BroadcastHeartbeat(emptyPackage bool) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	if rf.status != LEADER {
 		return
 	}
-	defer rf.heartbeatTimer.Reset(HeartbeatTime)
+	// defer rf.heartbeatTimer.Reset(HeartbeatTime)
+	defer rf.resetHeartbeatTimer()
 
 	// empty request
 	if emptyPackage {
@@ -311,27 +332,66 @@ func (rf *Raft) BroadcastHeartbeat(emptyPackage bool) {
 
 }
 
+// func (rf *Raft) ticker() {
+// 	for !rf.killed() {
+
+// 		select {
+// 		case <-rf.electionTimer.C:
+// 			rf.mu.Lock()
+// 			if rf.status != LEADER {
+// 				rf.leaderElection()
+// 				rf.electionTimer.Reset(randElectionTime())
+// 			}
+// 			rf.mu.Unlock()
+
+// 		case <-rf.heartbeatTimer.C:
+// 			rf.mu.Lock()
+// 			if rf.status == LEADER {
+// 				rf.BroadcastHeartbeat(false)
+// 			}
+// 			rf.mu.Unlock()
+
+// 		}
+
+//		}
+//	}
+func (rf *Raft) resetElectionTimer() {
+	electionTimeout := randElectionTime()
+	rf.electionTimeout = electionTimeout
+	rf.lastElection = time.Now()
+}
+func (rf *Raft) resetHeartbeatTimer() {
+	rf.lastHeartbeat = time.Now()
+}
+func (rf *Raft) pastElectionTimeout() bool {
+	return time.Since(rf.lastElection) > rf.electionTimeout
+}
+func (rf *Raft) pastHeartbeatTimeout() bool {
+	return time.Since(rf.lastHeartbeat) > rf.heartbeatTimeout
+}
+const tickInterval = 20 * time.Millisecond
 func (rf *Raft) ticker() {
 	for !rf.killed() {
+		rf.mu.Lock()
 
-		select {
-		case <-rf.electionTimer.C:
-			rf.mu.Lock()
-			if rf.status != LEADER {
+		switch rf.status {
+		case FOLLOWER:
+			fallthrough
+		case CANDIDATER:
+			if rf.pastElectionTimeout() {
 				rf.leaderElection()
-				rf.electionTimer.Reset(randElectionTime())
+				rf.resetElectionTimer()
 			}
-			rf.mu.Unlock()
 
-		case <-rf.heartbeatTimer.C:
-			rf.mu.Lock()
-			if rf.status == LEADER {
-				go rf.BroadcastHeartbeat(false)
+		case LEADER:
+			if rf.pastHeartbeatTimeout() {
+				// rf.resetHeartbeatTimer()
+				rf.BroadcastHeartbeat(false)
 			}
-			rf.mu.Unlock()
-
 		}
 
+		rf.mu.Unlock()
+		time.Sleep(tickInterval)
 	}
 }
 
@@ -345,6 +405,7 @@ func (rf *Raft) applier() {
 
 		// [lastApplied+1, commitIndex]
 		entries := rf.log.getRangeEntries(rf.lastApplied+1, rf.commitIndex)
+		commitIndex := rf.commitIndex
 		rf.mu.Unlock()
 
 		for i := range entries {
@@ -356,9 +417,8 @@ func (rf *Raft) applier() {
 		}
 
 		rf.mu.Lock()
-		lastIndex := entries[len(entries)-1].Index
-		if lastIndex > rf.lastApplied {
-			rf.lastApplied = lastIndex
+		if commitIndex > rf.lastApplied {
+			rf.lastApplied = commitIndex
 		}
 		rf.mu.Unlock()
 
