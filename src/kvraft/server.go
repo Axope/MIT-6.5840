@@ -1,28 +1,24 @@
 package kvraft
 
 import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
-	"log"
-	"sync"
-	"sync/atomic"
+	"go.uber.org/zap"
 )
 
-const Debug = false
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug {
-		log.Printf(format, a...)
-	}
-	return
-}
-
-
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Key   string
+	Value string
+	Opt   string
+
+	ClientUUID string
+	CommandID  int
 }
 
 type KVServer struct {
@@ -34,64 +30,181 @@ type KVServer struct {
 
 	maxraftstate int // snapshot if log grows this big
 
-	// Your definitions here.
+	stateMechine   StateMechine
+	session        Session
+	responseChans  ResponseChans
+	lastApplyIndex int
+
+	Logger *zap.Logger
 }
 
-
-func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
-}
-
-func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
-}
-
-// the tester calls Kill() when a KVServer instance won't
-// be needed again. for your convenience, we supply
-// code to set rf.dead (without needing a lock),
-// and a killed() method to test rf.dead in
-// long-running loops. you can also add your own
-// code to Kill(). you're not required to do anything
-// about this, but it may be convenient (for example)
-// to suppress debug output from a Kill()ed instance.
-func (kv *KVServer) Kill() {
-	atomic.StoreInt32(&kv.dead, 1)
-	kv.rf.Kill()
-	// Your code here, if desired.
-}
-
-func (kv *KVServer) killed() bool {
-	z := atomic.LoadInt32(&kv.dead)
-	return z == 1
-}
-
-// servers[] contains the ports of the set of
-// servers that will cooperate via Raft to
-// form the fault-tolerant key/value service.
-// me is the index of the current server in servers[].
-// the k/v server should store snapshots through the underlying Raft
-// implementation, which should call persister.SaveStateAndSnapshot() to
-// atomically save the Raft state along with the snapshot.
-// the k/v server should snapshot when Raft's saved state exceeds maxraftstate bytes,
-// in order to allow Raft to garbage-collect its log. if maxraftstate is -1,
-// you don't need to snapshot.
-// StartKVServer() must return quickly, so it should start goroutines
-// for any long-running work.
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
 
-	kv := new(KVServer)
-	kv.me = me
-	kv.maxraftstate = maxraftstate
+	kv := &KVServer{
+		mu:      sync.Mutex{},
+		me:      me,
+		applyCh: make(chan raft.ApplyMsg),
+		dead:    0,
 
-	// You may need initialization code here.
+		maxraftstate: maxraftstate,
 
-	kv.applyCh = make(chan raft.ApplyMsg)
+		stateMechine:   NewStateMechine(),
+		session:        NewSession(),
+		responseChans:  NewResponseChans(),
+		lastApplyIndex: 0,
+
+		Logger: NewLogger("DEBUG", fmt.Sprintf("server-%v.log", me)),
+	}
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	// kv.InstallSnapshot(persister.ReadSnapshot(), kv.rf.GetSnapshotLastIncludedIndex())
+	kv.InstallSnapshot(persister.ReadSnapshot(), 0)
 
-	// You may need initialization code here.
+	go kv.applier()
 
 	return kv
+}
+
+func (kv *KVServer) Operate(args *OperateArgs, reply *OperateReply) {
+	kv.mu.Lock()
+	defer kv.Logger.Sync()
+	kv.Logger.Debug("Operate", zap.Any("args", args))
+
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		kv.Logger.Info("not leader")
+		kv.mu.Unlock()
+		return
+	}
+
+	// 过滤已经执行过的操作
+	res := kv.session.getSessionResult(args.ClientUUID)
+	if res.LastCommandId == args.CommandID && res.Err == OK {
+		reply.Err = OK
+		reply.Value = res.Value
+		kv.Logger.Info("old result", zap.Any("reply", reply))
+		kv.mu.Unlock()
+		return
+	}
+
+	op := Op{
+		Key:        args.Key,
+		Value:      args.Value,
+		Opt:        args.Opt,
+		ClientUUID: args.ClientUUID,
+		CommandID:  args.CommandID,
+	}
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		kv.Logger.Info("not leader")
+		kv.mu.Unlock()
+		return
+	}
+
+	ch := kv.responseChans.getResponseChan(index)
+	kv.mu.Unlock()
+	select {
+	case res := <-ch:
+		reply.Err = res.Err
+		reply.Value = res.Value
+
+	case <-time.After(RaftTimeout):
+		reply.Err = ErrTimeout
+	}
+	kv.Logger.Debug("return reply", zap.Any("reply", reply))
+
+}
+
+func (kv *KVServer) doApplyWork(msg raft.ApplyMsg) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	defer kv.Logger.Sync()
+	kv.Logger.Debug("doApplyWork", zap.Any("msg", msg))
+
+	op, _ := msg.Command.(Op)
+	// 旧的日志消息
+	if msg.CommandIndex <= kv.lastApplyIndex {
+		return
+	}
+	kv.lastApplyIndex = msg.CommandIndex
+
+	// 已有结果，直接返回即可
+	res := kv.session.getSessionResult(op.ClientUUID)
+	if res.LastCommandId >= op.CommandID {
+		return
+	}
+
+	switch op.Opt {
+	case OptGet:
+		kv.session.setSessionResult(op.ClientUUID, sessionResult{
+			LastCommandId: op.CommandID,
+			Value:         kv.stateMechine.Get(op.Key),
+			Err:           OK,
+		})
+	case OptPut:
+		kv.stateMechine.Put(op.Key, op.Value)
+		kv.session.setSessionResult(op.ClientUUID, sessionResult{
+			LastCommandId: op.CommandID,
+			Value:         op.Value,
+			Err:           OK,
+		})
+	case OptAppend:
+		kv.stateMechine.Append(op.Key, op.Value)
+		kv.session.setSessionResult(op.ClientUUID, sessionResult{
+			LastCommandId: op.CommandID,
+			Value:         kv.stateMechine.Get(op.Key),
+			Err:           OK,
+		})
+	}
+
+	if _, isLeader := kv.rf.GetState(); isLeader {
+		ch := kv.responseChans.getResponseChan(msg.CommandIndex)
+		ch <- OperateReply{
+			Err:   OK,
+			Value: kv.stateMechine.Get(op.Key),
+		}
+	}
+
+	if kv.needSnapshot() {
+		kv.Logger.Debug("takeSnapshot", zap.Any("index", msg.Command))
+		kv.takeSnapshot(msg.CommandIndex)
+	}
+}
+
+func (kv *KVServer) doSnapshotWork(msg raft.ApplyMsg) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	defer kv.Logger.Sync()
+	kv.Logger.Debug("doSnapshotWork", zap.Any("msg", msg))
+
+	if msg.SnapshotIndex >= kv.lastApplyIndex {
+		kv.InstallSnapshot(msg.Snapshot, msg.SnapshotIndex)
+	}
+}
+
+func (kv *KVServer) applier() {
+	for !kv.killed() {
+		msg := <-kv.applyCh
+
+		if msg.CommandValid {
+			kv.doApplyWork(msg)
+		} else if msg.SnapshotValid {
+			kv.doSnapshotWork(msg)
+		}
+	}
+}
+
+// the tester calls Kill() when a KVServer instance won't
+// be needed again.
+func (kv *KVServer) Kill() {
+	atomic.StoreInt32(&kv.dead, 1)
+	kv.rf.Kill()
+}
+func (kv *KVServer) killed() bool {
+	z := atomic.LoadInt32(&kv.dead)
+	return z == 1
 }

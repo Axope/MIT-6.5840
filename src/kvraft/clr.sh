@@ -1,0 +1,1 @@
+rm -f client-* Raft-* server-*
